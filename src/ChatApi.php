@@ -64,6 +64,13 @@ final class ChatApi
         $chat = self::find((int)$id);
         $run = self::latestRun((int)$chat['id']);
         $events = $run && in_array($run['status'], self::ACTIVE, true) ? self::runEvents((int)$run['id']) : [];
+        $steps = [];
+        foreach ((new Query())->from(['e' => self::EVENT])->innerJoin(['r' => self::RUN], 'r.id = e.run_id')
+            ->where(['e.chat_id' => $chat['id'], 'e.type' => ['tool', 'step']])
+            ->andWhere(['not in', 'r.status', self::ACTIVE])
+            ->select(['r.message_id', 'r.id', 'e.text'])->orderBy('e.id')->all() as $row) {
+            $steps[$row['message_id']][] = $row['text'];
+        }
         return [
             'chatId' => (int)$chat['id'],
             'title' => $chat['title'],
@@ -77,6 +84,7 @@ final class ChatApi
             'pending' => self::publicPending(json_decode($chat['pending'] ?? 'null', true)),
             'run' => $run ? self::runSummary($run) : null,
             'events' => $events,
+            'steps' => (object)$steps,
             'lastEventId' => (int)((new Query())->from(self::EVENT)->where(['chat_id' => $chat['id']])->max('id') ?: 0),
         ];
     }
@@ -250,6 +258,29 @@ final class ChatApi
             throw new NotFoundHttpException();
         }
         return $file;
+    }
+
+    /** Link to the record an action created or changed, in this installation's administration. */
+    public static function recordLink(string $tool, int $id): ?array
+    {
+        $routes = [
+            'cms_ai_task_' => ['/cms/admin-cms-task/view', 'Открыть задачу №'],
+            'cms_task_' => ['/cms/admin-cms-task/view', 'Открыть задачу №'],
+            'cms_company_' => ['/cms/admin-cms-company/view', 'Открыть компанию №'],
+            'cms_deal_' => ['/cms/admin-cms-deal/view', 'Открыть услугу №'],
+            'cms_tree_' => ['/cms/admin-tree/update', 'Открыть раздел №'],
+            'page_css_' => ['/cms/admin-tree/update', 'Открыть раздел №'],
+        ];
+        if ($id <= 0) {
+            return null;
+        }
+        foreach ($routes as $prefix => [$route, $label]) {
+            if (str_starts_with($tool, $prefix)) {
+                $url = \skeeks\cms\backend\helpers\BackendUrlHelper::createByParams([$route, 'pk' => $id])->url;
+                return ['url' => \yii\helpers\Url::to($url, true), 'label' => $label . $id];
+            }
+        }
+        return null;
     }
 
     // Internal state of runs, shared with the executor bridge.

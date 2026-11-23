@@ -52,9 +52,23 @@ async function store(s,op,fields={}) {
 /** Progress goes to the run's event stream in order; a stop request is noticed on the next event. */
 function progress(s){
   let queue=Promise.resolve();
-  return {push(text){
-    queue=queue.then(()=>store(s,"agentEvent",{...s.ref,text})).then(r=>{if(r.cancel)s.cancel=true;}).catch(()=>{});
+  return {push(text,type="step"){
+    queue=queue.then(()=>store(s,"agentEvent",{...s.ref,text,type})).then(r=>{if(r.cancel)s.cancel=true;}).catch(()=>{});
   },flush(){return queue;}};
+}
+// Human step labels for the chat: what the agent looks at, not the operation name.
+const subjects=[["cms_ai_project_files","файлы проекта"],["cms_ai_current_user","ваш профиль"],["cms_content_element","публикации"],
+  ["cms_crm_history","историю клиента"],["cms_crm_client","обзор клиентов"],["cms_comm_chat","чаты"],["cms_comm_draft","черновики писем"],
+  ["cms_comm","переписку"],["cms_tree","разделы сайта"],["cms_task","задачи"],["cms_company","компании"],["cms_lead","сделки"],
+  ["cms_deal","услуги"],["cms_project","проекты"],["cms_worker","сотрудников"],["cms_user","пользователей"],["cms_proposal","предложения"],
+  ["cms_telephony","звонки"],["cms_sms","SMS"],["cms_storage","файлы"],["shop_bill","счета"],["shop_order","заказы"],
+  ["shop_payment","платежи"],["shop_","магазин"],["site_template","шаблоны страниц"]];
+function stepLabel(name){
+  const subject=subjects.find(([prefix])=>name.startsWith(prefix))?.[1];
+  if(!subject)return "Обращаюсь к CRM: "+name;
+  if(/_stats$|_count$/.test(name))return "Считаю "+subject;
+  if(/_resolve$|_search$|_duplicate_check$/.test(name))return "Ищу "+subject;
+  return "Смотрю "+subject;
 }
 class Canceled extends Error {}
 async function chatTurn(s, turn, image, request = turn, steps = []) {
@@ -136,7 +150,7 @@ function localReadAnswer(result,display){
   return lines.join("\n") || (rows.length?"CRM вернула данные без полей для краткого отображения.":"Записей в выборке нет.");
 }
 async function run(s,message,{messageId,worker=false,outcome=null}) {
-  s.progress.push("Проверяю доступные операции на сайте.");
+  s.progress.push("Обдумываю поручение","thinking");
   const gateway=s.engine.id==="claude-vclaude";
   let catalog=(await api(s,"/tools/index")).tools;
   if(catalog.some(t=>t.name==="cms_tree_get"))catalog.push(previewTool);
@@ -167,6 +181,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
     if(step.action==="background"){history.push({status:"Фоновый режим уже включён. Продолжай выполнение."});continue;}
     if(step.action==="skill"){
       const selected=site.skills.get(step.tool);
+      if(selected)s.progress.push("Применяю навык «"+step.tool.replace(/^(skeeks|site)\//,"")+"»","tool");
       history.push(selected?{skill:step.tool,instructions:selected.body}:{error:"Навык недоступен."});
       continue;
     }
@@ -174,7 +189,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       if(gateway){history.push({error:"Вложения не подключены к профилю VClaude."});continue;}
       const selected=s.files.find(f=>String(f.id)===step.tool);
       if(!selected){history.push({error:"Файл отсутствует в выбранном чате."});continue;}
-      s.progress.push("Читаю вложение "+selected.name+".");
+      s.progress.push("Читаю файл «"+selected.name+"»","tool");
       const parsed=await extractFile(await store(s,"file",{fileId:selected.id}));
       image=parsed.image;
       history.push({attachment:selected.name,...(image?{imageProvided:true}:parsed)});
@@ -189,7 +204,6 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       continue;
     }
     if(step.action==="schema"){
-      s.progress.push("Изучаю параметры " + tool.name + ".");
       const schema=[previewTool,styleTool,templatesTool].includes(tool)?tool:(await api(s,"/tools/"+tool.name)).tool;
       schemas.set(tool.name,schema);
       history.push({schema});continue;
@@ -199,7 +213,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
     const args=JSON.parse(step.arguments_json);
     if(!args||Array.isArray(args)||typeof args!=="object")throw new Error("Некорректные параметры.");
     if(tool===templatesTool){
-      s.progress.push("Сравниваю шаблоны опубликованных страниц.");
+      s.progress.push("Сравниваю шаблоны опубликованных страниц","tool");
       history.push({tool:tool.name,result:await templateExamples(s,args.parent_id)});
       continue;
     }
@@ -220,7 +234,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       if(previewURL.origin!==crm)throw Error("Недопустимый адрес предпросмотра.");
       const response=await fetch(previewURL,{headers:ticket?{"X-Skeeks-Preview":ticket}:{},redirect:"error",signal:AbortSignal.timeout(30000)});
       if(!response.ok)throw Error("Предпросмотр недоступен (HTTP "+response.status+").");
-      s.progress.push("Открываю раздел №"+args.tree_id+" в браузере · "+(args.viewport==="phone"?"телефон":"компьютер"));
+      s.progress.push("Открываю раздел №"+args.tree_id+" в браузере · "+(args.viewport==="phone"?"телефон":"компьютер"),"tool");
       const shot=await capturePreview(args,await response.text(),crm,ticket?undefined:previewURL.href);
       if(gateway && !shot.base64){history.push({tool:tool.name,error:"Не удалось снять выбранное состояние."});continue;}
       if(!shot.base64){history.push({tool:tool.name,args,result:shot.evidence});continue;}
@@ -240,7 +254,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       s.pending={id:random(),tool:tool.name,args,messageId};
       return "Подтвердите действие в CRM.";
     }
-    s.progress.push("Запрашиваю " + tool.name + ".");
+    s.progress.push(stepLabel(tool.name),"tool");
     let result;
     try{
       result=(await api(s,"/tools/"+tool.name,args)).data;
@@ -249,7 +263,6 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       history.push({tool:tool.name,args,error:error.treeMissing?"Раздел не найден.":error.message});
       continue;
     }
-    s.progress.push("CRM вернула результат.");
     if(localRead){
       if(["count","list"].includes(step.display))return localReadAnswer(result,step.display);
       history.push({tool:tool.name,result:{status:"Данные получены только для показа пользователю. Промежуточное чтение не завершает поручение. Для показа результата используй display=list или count при execute."}});
@@ -264,7 +277,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       history.push({tool:tool.name,args,result:compact(result)});
     }
   }
-  s.progress.push("Подвожу итог по полученным данным.");
+  s.progress.push("Подвожу итог","thinking");
   const final = await chatTurn(s, {
     latestStep: history.at(-1),
     protocol: "Поиск в этом сообщении завершён. Верни только answer. Ответь по подтверждённым результатам. Если сведений мало, обозначь границы поиска и задай конкретный вопрос, который поможет продолжить. Не утверждай, что записи нет, если просмотрена только часть данных."
@@ -294,17 +307,21 @@ async function agentWork(req){
     const claim=await store(s,"agentClaimWrite",ref);
     if(claim.cancel)return store(s,"agentFinish",{...ref,text:"Поручение остановлено до изменения.",canceled:true});
     if(!claim.claimed)return store(s,"agentFinish",{...ref,text:"Работа прервалась во время изменения. Проверьте результат в CMS перед повтором.",failed:true});
-    s.progress.push("Выполняю подтверждённое действие "+p.tool+".");
+    s.progress.push("Выполняю подтверждённое действие","tool");
     try{
       const headers={"x-skeeks-ai-chat":String(chat),"x-skeeks-ai-request":p.id};
       if(p.tool==="cms_ai_site_drafts_create")headers["x-skeeks-ai-bridge"]=bridgeKey;
-      outcome={tool:p.tool,result:compact(await confirmedTool(s,p,headers))};
+      const done=await confirmedTool(s,p,headers);
+      outcome={tool:p.tool,result:compact(done)};
+      const recordId=Number(done?.id ?? done?.task_id);
+      if(Number.isSafeInteger(recordId) && recordId>0)outcome.record={tool:p.tool,id:recordId};
     }catch(error){
       await s.progress.flush();
       return store(s,"agentFinish",{...ref,text:"Не удалось подтвердить результат действия "+p.tool+". "+error.message,failed:true});
     }
     await store(s,"agentWriteResult",{...ref,outcome});
   }
+  s.record=outcome?.record;
   let text,state={};
   try{
     text=await run(s,job.message,{messageId:job.messageId,worker:true,outcome});
@@ -313,7 +330,7 @@ async function agentWork(req){
     text="Поручение остановлено. Выполненные шаги сохранены в ходе работы.";state={canceled:true};
   }
   await s.progress.flush();
-  return store(s,"agentFinish",{...ref,...state,text,pending:state.canceled?null:s.pending,screenshots:[...s.screenshots.values()]});
+  return store(s,"agentFinish",{...ref,...state,text,pending:state.canceled?null:s.pending,record:s.record,screenshots:[...s.screenshots.values()]});
 }
 async function body(req){
   req.setEncoding("utf8");

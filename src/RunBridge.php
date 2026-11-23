@@ -81,7 +81,13 @@ final class RunBridge
                 }
                 $pending = isset($data['pending']) && is_array($data['pending']) ? $data['pending'] : null;
                 $status = !empty($data['canceled']) ? 'canceled' : (!empty($data['failed']) ? 'failed' : 'succeeded');
-                ChatApi::finish($run, $status, mb_substr((string)($data['text'] ?? ''), 0, 6000) ?: 'Готово.', $pending, $screenshots);
+                $text = mb_substr((string)($data['text'] ?? ''), 0, 6000) ?: 'Готово.';
+                $record = $data['record'] ?? null;
+                if (is_array($record) && ($link = ChatApi::recordLink((string)($record['tool'] ?? ''), (int)($record['id'] ?? 0)))
+                    && !str_contains($text, $link['url'])) {
+                    $text .= "\n\n[" . $link['label'] . '](' . $link['url'] . ')';
+                }
+                ChatApi::finish($run, $status, $text, $pending, $screenshots);
                 return ['done' => true];
             default:
                 throw new BadRequestHttpException();
