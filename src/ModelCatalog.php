@@ -31,6 +31,24 @@ final class ModelCatalog
         return (string)(Yii::$app->params['cmsAi']['engineModels'][$engine] ?? Yii::$app->params['cmsAi']['engineModels'][$engineKey] ?? '');
     }
 
+    /** Models of an engine available to this installation: [['id' => …, 'title' => …]]. */
+    public static function forEngine(string $engine): array
+    {
+        $engineKey = preg_replace('/-.*$/', '', $engine);
+        $result = [];
+        foreach (self::models() as $id => $model) {
+            if (($model['engine'] ?? '') === $engineKey && empty($model['hidden'])) {
+                $result[] = ['id' => (string)$id, 'title' => (string)($model['title'] ?? $id)];
+            }
+        }
+        return $result;
+    }
+
+    public static function allowed(string $engine, string $model): bool
+    {
+        return in_array($model, array_column(self::forEngine($engine), 'id'), true);
+    }
+
     public static function title(string $model): string
     {
         return (string)(self::models()[$model]['title'] ?? $model);

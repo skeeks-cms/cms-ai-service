@@ -39,7 +39,8 @@ final class RunBridge
         $input = $int($usage['input'] ?? 0);
         $cached = min($input, $int($usage['cached'] ?? 0));
         $output = $int($usage['output'] ?? 0);
-        $model = ModelCatalog::resolve((string)$run['engine'], is_string($usage['model'] ?? null) ? trim($usage['model']) : '');
+        $reported = is_string($usage['model'] ?? null) ? trim($usage['model']) : '';
+        $model = ModelCatalog::resolve((string)$run['engine'], $reported !== '' ? $reported : (string)($run['model'] ?? ''));
         $engineCost = !empty($usage['costKnown']) && is_numeric($usage['costUsd'] ?? null) ? (float)$usage['costUsd'] : null;
         [$usd, $source] = ModelCatalog::estimate($model, $input, $cached, $output, $engineCost);
         Yii::$app->db->createCommand()->update(ChatApi::RUN, [
@@ -76,6 +77,7 @@ final class RunBridge
                 return [
                     'message' => $message, 'messageId' => (int)$run['message_id'],
                     'confirmed' => json_decode($run['confirmation'] ?? 'null', true), 'state' => (object)$state, 'cancel' => $cancel,
+                    'model' => $run['model'] ?? null,
                 ];
             case 'agentEvent':
                 $text = (string)($data['text'] ?? '');

@@ -77,7 +77,7 @@ class Canceled extends Error {}
 async function chatTurn(s, turn, image, request = turn, steps = []) {
   const binding = createHash("sha256").update(resource + "|" + s.chatId).digest("hex");
   const result = await runEngineStep(s.engine, {
-    binding, sessionId: s.engineSession, turn, image, history: s.history, request, steps
+    binding, sessionId: s.engineSession, turn, image, history: s.history, request, steps, model: s.model || undefined
   });
   if (s.engineSession === null && result.sessionId !== null) {
     await store(s, "bindEngine", {engine: s.engine.id, session: result.sessionId});
@@ -315,6 +315,7 @@ async function agentWork(req){
   const ref=s.ref;
   const job=await store(s,"agentStart",ref);
   if(job.done)return job;
+  s.model=typeof job.model==="string" ? job.model : null;
   if(job.cancel)return store(s,"agentFinish",{...ref,text:"Поручение остановлено.",canceled:true});
   await loadChat(s,chat);
   if(!s.engine)return store(s,"agentFinish",{...ref,text:"Профиль движка этого чата сейчас недоступен.",failed:true});

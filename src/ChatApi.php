@@ -55,8 +55,13 @@ final class ChatApi
                 ->orderBy(['updated_at' => SORT_DESC, 'id' => SORT_DESC])->select('id')->scalar() ?: null;
         }
         $engines = self::engines($scope['owner_id']);
+        $models = [];
+        foreach ($engines as $engine) {
+            $models[$engine] = ModelCatalog::forEngine($engine);
+        }
         if ($id === null) {
             return ['chatId' => null, 'title' => self::DEFAULT_TITLE, 'engine' => $engines[0] ?? null, 'engines' => $engines,
+                'models' => $models, 'model' => null,
                 'company' => $company ?: null, 'history' => [], 'files' => [], 'pending' => null, 'run' => null, 'events' => [], 'lastEventId' => 0];
         }
         $chat = self::find((int)$id);
@@ -86,6 +91,8 @@ final class ChatApi
             'title' => $chat['title'],
             'engine' => $chat['engine'],
             'engines' => $engines,
+            'models' => $models,
+            'model' => $chat['model'] ?? null,
             'company' => $chat['company_id'] ? (int)$chat['company_id'] : null,
             'history' => (new Query())->from(self::MESSAGE)->where(['chat_id' => $chat['id']])
                 ->select(['id', 'role', 'text'])->orderBy('id')->all(),
@@ -124,8 +131,9 @@ final class ChatApi
             throw new BadRequestHttpException('Введите поручение до 1800 символов.');
         }
         $requestKey = hash('sha256', 'message|' . $clientKey);
+        $model = trim((string)($data['model'] ?? ''));
         $db = Yii::$app->db;
-        [$runId, $created] = $db->transaction(function () use ($db, $data, $scope, $text, $files, $requestKey) {
+        [$runId, $created] = $db->transaction(function () use ($db, $data, $scope, $text, $files, $requestKey, $model) {
             $chatId = isset($data['chatId']) ? (int)$data['chatId'] : 0;
             if ($chatId) {
                 self::lock($chatId);
@@ -150,6 +158,12 @@ final class ChatApi
                 $chatId = (int)$db->lastInsertID;
                 $chat = self::find($chatId);
             }
+            // The model chosen at the composer applies to this and the next runs of the chat.
+            if ($model !== '' && !ModelCatalog::allowed((string)$chat['engine'], $model)) {
+                throw new ForbiddenHttpException('Эта модель недоступна для аккаунта.');
+            }
+            $db->createCommand()->update(self::CHAT, ['model' => $model !== '' ? $model : null], ['id' => $chatId])->execute();
+            $chat['model'] = $model !== '' ? $model : null;
             $db->createCommand()->insert(self::MESSAGE, [
                 'chat_id' => $chatId, 'role' => 'user', 'text' => $text, 'created_at' => time(),
             ])->execute();
@@ -516,7 +530,7 @@ final class ChatApi
         $db->createCommand()->insert(self::RUN, [
             'chat_id' => $chat['id'], 'message_id' => $messageId, 'request_key' => $requestKey,
             'confirmation' => $confirmation === null ? null : json_encode($confirmation, JSON_THROW_ON_ERROR),
-            'engine' => $chat['engine'], 'status' => 'queued', 'state' => '{}',
+            'engine' => $chat['engine'], 'model' => $chat['model'] ?? null, 'status' => 'queued', 'state' => '{}',
             'credential' => RunCredentials::encrypt(RunCredentials::issue($userId)),
             'created_by' => $userId, 'created_at' => time(), 'updated_at' => time(),
         ])->execute();
