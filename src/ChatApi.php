@@ -249,6 +249,55 @@ final class ChatApi
         return self::runSummary(self::findRun($runId));
     }
 
+    /**
+     * A message added to the working run (like a queued message sent at once in the desktop app).
+     * The executor receives it with its next event; one not read before the run ends starts a new run.
+     */
+    public static function steer(int $chatId, int $runId, string $text): array
+    {
+        $text = trim($text);
+        if ($text === '' || mb_strlen($text) > 1800) {
+            throw new BadRequestHttpException('Введите сообщение до 1800 символов.');
+        }
+        return Yii::$app->db->transaction(function () use ($chatId, $runId, $text) {
+            self::lock($chatId);
+            self::find($chatId);
+            $run = (new Query())->from(self::RUN)->where(['id' => $runId, 'chat_id' => $chatId])->one();
+            if (!$run || !in_array($run['status'], self::ACTIVE, true) || $run['cancel_requested_at']) {
+                throw new ConflictHttpException('Поручение уже завершилось. Отправьте сообщение обычным способом.');
+            }
+            $db = Yii::$app->db;
+            $db->createCommand()->insert(self::MESSAGE, [
+                'chat_id' => $chatId, 'role' => 'user', 'text' => $text, 'created_at' => time(),
+            ])->execute();
+            $db->createCommand()->update(self::CHAT, ['updated_at' => time()], ['id' => $chatId])->execute();
+            self::event($run, 'steer', 'Учитываю ваше сообщение');
+            return self::runSummary(self::findRun($runId));
+        });
+    }
+
+    /** User messages of the chat added during the run and not yet given to the executor. */
+    public static function undelivered(array $run): array
+    {
+        $state = json_decode($run['state'], true) ?: [];
+        $after = max((int)$run['message_id'], (int)($state['delivered'] ?? 0));
+        return (new Query())->from(self::MESSAGE)->where(['chat_id' => $run['chat_id'], 'role' => 'user'])
+            ->andWhere(['>', 'id', $after])->select(['id', 'text'])->orderBy('id')->all();
+    }
+
+    /** A follow-up run for messages the finished run never read; the caller holds the chat lock. */
+    public static function followUp(array $run): void
+    {
+        $left = self::undelivered($run);
+        if (!$left) {
+            return;
+        }
+        $last = end($left);
+        $chat = (new Query())->from(self::CHAT)->where(['id' => $run['chat_id']])->one();
+        $runId = self::createRun($chat, (int)$last['id'], hash('sha256', 'followup|' . $last['id']), null);
+        self::queue($runId);
+    }
+
     public static function rename(int $chatId, string $title): void
     {
         $title = trim(preg_replace('/\s+/u', ' ', $title));

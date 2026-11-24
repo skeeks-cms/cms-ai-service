@@ -53,7 +53,10 @@ async function store(s,op,fields={}) {
 function progress(s){
   let queue=Promise.resolve();
   return {push(text,type="step"){
-    queue=queue.then(()=>store(s,"agentEvent",{...s.ref,text,type})).then(r=>{if(r.cancel)s.cancel=true;}).catch(()=>{});
+    queue=queue.then(()=>store(s,"agentEvent",{...s.ref,text,type,acceptsNotes:true})).then(r=>{
+      if(r.cancel)s.cancel=true;
+      if(Array.isArray(r.notes) && r.notes.length)(s.notes??=[]).push(...r.notes);
+    }).catch(()=>{});
   },flush(){return queue;}};
 }
 // Human step labels for the chat: what the agent looks at, not the operation name.
@@ -175,6 +178,11 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
   for(let i=0;i<24;i++){
     await s.progress.flush();
     if(s.cancel)throw new Canceled();
+    // Messages the employee sent during the run join the work before the next step.
+    if(s.notes?.length){
+      const notes=s.notes.splice(0);
+      history.push({employeeAddedDuringWork:notes,instruction:"Учти эти сообщения сотрудника в текущем поручении."});
+    }
     const turn=i===0 ? request : {latestStep:history.at(-1),protocol:"Продолжи текущее поручение с учётом результата."};
     const step=await chatTurn(s,turn,image,request,history);
     image=undefined;
@@ -278,6 +286,8 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
     }
   }
   s.progress.push("Подвожу итог","thinking");
+  await s.progress.flush();
+  if(s.notes?.length)history.push({employeeAddedDuringWork:s.notes.splice(0),instruction:"Учти эти сообщения сотрудника в ответе."});
   const final = await chatTurn(s, {
     latestStep: history.at(-1),
     protocol: "Поиск в этом сообщении завершён. Верни только answer. Ответь по подтверждённым результатам. Если сведений мало, обозначь границы поиска и задай конкретный вопрос, который поможет продолжить. Не утверждай, что записи нет, если просмотрена только часть данных."

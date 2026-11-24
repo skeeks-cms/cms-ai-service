@@ -18,6 +18,17 @@ final class RunBridge
 {
     public const OPS = ['agentStart', 'agentEvent', 'agentClaimWrite', 'agentWriteResult', 'agentFinish'];
 
+    /** Messages sent during the run, handed to the executor once; marks them delivered. */
+    private static function notes(array $run, array &$state): array
+    {
+        $notes = ChatApi::undelivered($run);
+        if ($notes) {
+            $state['delivered'] = (int)end($notes)['id'];
+            Yii::$app->db->createCommand()->update(ChatApi::RUN, ['state' => json_encode($state, JSON_THROW_ON_ERROR)], ['id' => $run['id']])->execute();
+        }
+        return array_column($notes, 'text');
+    }
+
     public static function handle(string $op, array $chat, array $data): array
     {
         $run = (new Query())->from(ChatApi::RUN)->where(['id' => (int)($data['run'] ?? 0), 'chat_id' => $chat['id']])->one();
@@ -52,7 +63,8 @@ final class RunBridge
                     throw new BadRequestHttpException();
                 }
                 ChatApi::event($run, $type, $text);
-                return ['cancel' => $cancel];
+                // Only an executor that declares it reads the notes gets them; otherwise they start a follow-up run.
+                return ['cancel' => $cancel, 'notes' => empty($data['acceptsNotes']) ? [] : self::notes($run, $state)];
             case 'agentClaimWrite':
                 if ($cancel) {
                     return ['claimed' => false, 'cancel' => true];
@@ -88,6 +100,10 @@ final class RunBridge
                     $text .= "\n\n[" . $link['label'] . '](' . $link['url'] . ')';
                 }
                 ChatApi::finish($run, $status, $text, $pending, $screenshots);
+                // A message sent during the run that the executor never read starts the next run.
+                if ($status === 'succeeded' && !$pending) {
+                    ChatApi::followUp(ChatApi::findRun((int)$run['id']));
+                }
                 return ['done' => true];
             default:
                 throw new BadRequestHttpException();
