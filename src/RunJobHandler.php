@@ -49,7 +49,8 @@ final class RunJobHandler extends AbstractJobHandler
         $body = curl_exec($curl);
         $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
         if ($body === false || $status >= 500) {
-            throw new JobTransientException("Исполнитель временно недоступен ($status).");
+            $reason = is_string($body) ? (string)(json_decode($body, true)['error'] ?? '') : '';
+            throw new JobTransientException("Исполнитель временно недоступен ($status)." . ($reason !== '' ? ' ' . mb_substr($reason, 0, 300) : ''));
         }
         try {
             if ($status !== 200 || empty(json_decode((string)$body, true)['done'])) {
