@@ -68,6 +68,16 @@ final class ModelCatalog
         return in_array($model, array_column(self::forEngine($engine), 'id'), true);
     }
 
+    /** Context window of a model in tokens (params: model 'context', else cmsAi.engineContext[engine]); 0 if unknown. */
+    public static function contextWindow(string $engine, string $model): int
+    {
+        if ($model !== '' && isset(self::models()[$model]['context'])) {
+            return (int)self::models()[$model]['context'];
+        }
+        $engineKey = preg_replace('/-.*$/', '', $engine);
+        return (int)(Yii::$app->params['cmsAi']['engineContext'][$engineKey] ?? 0);
+    }
+
     public static function title(string $model): string
     {
         return (string)(self::models()[$model]['title'] ?? $model);

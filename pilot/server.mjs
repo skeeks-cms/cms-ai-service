@@ -74,18 +74,39 @@ function stepLabel(name){
   return "Смотрю "+subject;
 }
 class Canceled extends Error {}
+/**
+ * A stateless engine gets the whole context with every call: the request, the steps of this run and the
+ * recent conversation. Resuming a Codex thread re-adds its own prompt (~18k tokens) on every call,
+ * so each step of a run and each message of a chat grew more expensive.
+ */
+function statelessTurn(s, turn, request, steps) {
+  const conversation = (s.history || []).slice(-16).map(m => ({role: m.role, text: String(m.text).slice(0, 1500)}));
+  let kept = [], size = 0;
+  for (const step of [...steps].reverse()) {
+    const length = JSON.stringify(step).length;
+    if (size + length > 40000 && kept.length) break;
+    kept.unshift(step); size += length;
+  }
+  return {...request, conversation, stepsOfThisRequest: kept, omittedEarlierSteps: steps.length - kept.length,
+    ...(turn !== request ? {protocol: turn.protocol} : {})};
+}
 async function chatTurn(s, turn, image, request = turn, steps = []) {
   const binding = createHash("sha256").update(resource + "|" + s.chatId).digest("hex");
+  const stateless = s.engine.stateless === true;
+  if (stateless) turn = statelessTurn(s, turn, request, steps);
   const result = await runEngineStep(s.engine, {
-    binding, sessionId: s.engineSession, turn, image, history: s.history, request, steps, model: s.model || undefined, effort: s.effort || undefined
+    binding, sessionId: stateless ? null : s.engineSession, turn, image, history: s.history, request, steps, model: s.model || undefined, effort: s.effort || undefined
   });
-  if (s.engineSession === null && result.sessionId !== null) {
+  if (!stateless && s.engineSession === null && result.sessionId !== null) {
     await store(s, "bindEngine", {engine: s.engine.id, session: result.sessionId});
     s.engineSession = result.sessionId;
   }
   // Token usage of the run: summed over model calls; cost only when the engine reports it for every call.
   const u = result.usage, total = s.usage ??= {input:0,cached:0,output:0,calls:0,tools:0,model:"",costUsd:0,costKnown:true};
   total.calls++;
+  if (u && typeof u === "object") s.lastCall = {input: Math.max(0, u.input|0), cached: Math.max(0, u.cached|0)};
+  // Per-call usage for diagnostics (not shown in the chat).
+  if (u && typeof u === "object") s.progress.push("call "+total.calls+": in="+(u.input|0)+" cached="+(u.cached|0)+" out="+(u.output|0)+" sent="+JSON.stringify(turn).length+" chars","usage");
   if (u && typeof u === "object") {
     for (const k of ["input","cached","output"]) total[k] += Math.max(0, Number(u[k]) || 0);
     if (typeof u.model === "string" && u.model) total.model = u.model.slice(0,100);
@@ -98,7 +119,7 @@ async function loadChat(s,id){
   s.siteId=Number(chat.site_id);
   s.engineId=chat.engine;
   s.engine=enginesFor(chat.owner_id).find(engine=>engine.id===chat.engine);
-  s.chatId=Number(chat.id);s.engineSession=chat.engine_sessions[chat.engine] ?? null;s.history=chat.history;s.files=chat.files;
+  s.chatId=Number(chat.id);s.engineSession=chat.engine_sessions[chat.engine] ?? null;s.catalogRevs=chat.catalog_revs ?? {};s.history=chat.history;s.files=chat.files;
   s.company=Number(chat.company_id)||null;s.pending=chat.pending;
 }
 const gatewayTreeTools=new Set(["cms_tree_get","cms_tree_resolve","cms_tree_list","cms_tree_create","cms_tree_update"]);
@@ -160,6 +181,32 @@ function localReadAnswer(result,display){
   if(Number.isSafeInteger(total) && rows.length<total)lines.push("В этой выборке: "+rows.length+".");
   return lines.join("\n") || (rows.length?"CRM вернула данные без полей для краткого отображения.":"Записей в выборке нет.");
 }
+// Two-level catalog: sections of operations first, the operations of a section on request.
+const siteDesignTools=new Set(["site_template_examples","browser_preview","page_css_update"]);
+function groupKeyOf(name,depth=2){
+  if(siteDesignTools.has(name))return "site_design";
+  return name.split("_").slice(0,depth).join("_");
+}
+function catalogGroups(catalog){
+  const groups=new Map();
+  for(const t of catalog){const k=groupKeyOf(t.name);(groups.get(k)??groups.set(k,[]).get(k)).push(t);}
+  // Large sections are split one level deeper so a section stays readable.
+  for(const [k,tools] of [...groups]){
+    if(tools.length<=20 || k==="site_design")continue;
+    groups.delete(k);
+    for(const t of tools){const k3=groupKeyOf(t.name,3);(groups.get(k3)??groups.set(k3,[]).get(k3)).push(t);}
+  }
+  return groups;
+}
+function groupTitle(key){
+  if(key==="site_design")return "оформление и предпросмотр страниц сайта";
+  return subjects.find(([prefix])=>key.startsWith(prefix) || prefix.startsWith(key))?.[1] || key;
+}
+function groupDirectory(groups){
+  // Names only: a simple request can go straight to execute; descriptions come with the section.
+  return [...groups].map(([key,tools])=>({group:key,title:groupTitle(key),operations:tools.map(t=>t.name)}));
+}
+const catalogHowTo="catalogGroups — разделы операций этой установки с именами операций. Если операция и её аргументы понятны по имени, сразу верни execute — схему сервис подставит сам, а при ошибке аргументов вернёт её вместе с ошибкой. Описания операций раздела: action=schema, tool=group:<ключ раздела>. Полная схема одной операции: action=schema, tool=<имя>.";
 async function run(s,message,{messageId,worker=false,outcome=null}) {
   s.progress.push("Обдумываю поручение","thinking");
   const gateway=s.engine.id==="claude-vclaude";
@@ -171,18 +218,29 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
   const names=new Map(catalog.map(t=>[t.name,t]));
   const currentUser = !gateway && names.has("cms_ai_current_user_get")
     ? (await api(s,"/tools/cms_ai_current_user_get",{})).data : null;
-  // Keep room for the conversation, full schemas and tool results.
+  // Full catalog with descriptions, as the agent chooses best from it (measured 24.11.2026: a two-level
+  // catalog took more steps and more uncached tokens). It is sent once per engine session.
+  const groups=catalogGroups(catalog);
   const descriptionLength=Math.max(0,Math.min(120,Math.floor(55000/catalog.length)-40));
   const directory=catalog.map(t=>[t.name,(t.description||"").slice(0,descriptionLength)]);
+  // One copy per engine session: a resumed session that already saw this list gets a short note instead.
+  const catalogRev=createHash("sha256").update(JSON.stringify(directory)).digest("hex").slice(0,32);
+  const catalogKnown=s.engine.stateless!==true && s.engineSession!==null && s.catalogRevs?.[s.engine.id]===catalogRev;
   const site=gateway?{skills:new Map(),globalRules:"",projectRules:""}:await knowledge(await store(s,"settings"));
   const skills=Array.from(site.skills,([name,item])=>({name,description:item.description}));
   const history=[];
   let image;
   const schemas=new Map();
-  const request = {message,today:new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Moscow"}).format(new Date()),currentUser,companyId:s.company,catalog:directory,globalRules:site.globalRules,projectRules:site.projectRules,skills,attachments:gateway?[]:s.files,
+  const request = {message,today:new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Moscow"}).format(new Date()),currentUser,companyId:s.company,...(catalogKnown?{catalogNote:"Каталог операций прежний, он есть выше в этой сессии."}:{catalog:directory}),globalRules:site.globalRules,projectRules:site.projectRules,skills,attachments:gateway?[]:s.files,
       worker,outcome:gateway && outcome ? {tool:outcome.tool,result:gatewayTreeResult(outcome.result || {})} : outcome,
       executionPolicy:"Поручение выполняется в фоне, сотрудник видит ход работы. outcome содержит уже выполненное действие, не повторяй его. Короткий запрос выполни сразу. Когда цель достигнута, верни answer с результатом.",
       protocol:(gateway?"Результат чтения записей показывает сама CMS. Для запроса количества добавь display=count к шагу execute, для списка display=list. Когда схема использует по умолчанию текущего сотрудника или дату, оставь эти аргументы пустыми. ":"")+"Учитывай назначение сущностей: оформление, страница или черновик в контексте сайта относятся к опубликованным материалам и разделам CMS; оказание услуги конкретному клиенту относится к CRM. Для оформления в стиле сайта самостоятельно найди похожие опубликованные страницы, даже если ссылок в переписке нет. Сравни несколько соседних страниц: структуру их контента, повторно используемые шаблоны и фактический вид в браузере. Выбирай шаблон по увиденному, учитывая, пригоден ли он для нового содержимого. Проверь созданный результат в браузере на телефоне и компьютере, приложи снимки. Перед выводом о содержимом страницы проверь ключевые фразы и цену из поручения через expected_text. Если textFound=false, исправь страницу и повтори проверку. Используй уже указанные в переписке страницы как примеры. Когда ответ можно установить осмотром примера, сначала осмотри его доступными инструментами, включая browser_preview для оформления и эффектов. Затем выполни поручение. Вопрос пользователю нужен, только если после проверки остаётся существенный выбор. Если объект запроса вообще не указан и в переписке его нет, уточни объект. Заново запроси схему перед первым вызовом каждого инструмента в этом поручении."};
+  // Composition of what the service itself puts into the context, in characters (an estimate for the panel).
+  const size=v=>JSON.stringify(v??"").length;
+  s.contextParts={rules:size(site.globalRules)+size(site.projectRules)+size(request.protocol)+size(request.executionPolicy),
+    catalog:catalogKnown?0:size(directory),skills:size(skills),attachments:size(request.attachments),
+    conversation:size(message)+size(s.history),tools:0};
+  s.contextHistory=history;
   for(let i=0;i<24;i++){
     await s.progress.flush();
     if(s.cancel)throw new Canceled();
@@ -194,6 +252,10 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
     const turn=i===0 ? request : {latestStep:history.at(-1),protocol:"Продолжи текущее поручение с учётом результата."};
     const step=await chatTurn(s,turn,image,request,history);
     image=undefined;
+    if(i===0 && !catalogKnown && s.engineSession!==null){
+      store(s,"catalogSeen",{engine:s.engine.id,rev:catalogRev}).catch(()=>{});
+      (s.catalogRevs??={})[s.engine.id]=catalogRev;
+    }
     if(step.action==="background"){history.push({status:"Фоновый режим уже включён. Продолжай выполнение."});continue;}
     if(step.action==="skill"){
       const selected=site.skills.get(step.tool);
@@ -212,9 +274,25 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       continue;
     }
     if(step.action==="answer")return String(step.answer).slice(0,6000);
+    if(step.action==="schema" && typeof step.tool==="string" && step.tool.startsWith("group:")){
+      const key=step.tool.slice(6), tools=groups.get(key);
+      if(!tools){history.push({error:"Такого раздела нет.",catalogGroups:directory});continue;}
+      s.progress.push("Смотрю раздел «"+groupTitle(key)+"»","thinking");
+      // A small section comes with full schemas, so the next step can execute directly.
+      const withSchemas=tools.length<=6;
+      const operations=[];
+      for(const t of tools){
+        if(withSchemas){
+          const schema=[previewTool,styleTool,templatesTool].includes(t)?t:(await api(s,"/tools/"+t.name)).tool;
+          schemas.set(t.name,schema);operations.push({schema});
+        }else operations.push({name:t.name,description:(t.description||"").slice(0,300)});
+      }
+      history.push({group:key,title:groupTitle(key),operations,...(withSchemas?{}:{next:"Запроси schema нужной операции."})});
+      continue;
+    }
     const tool=names.get(step.tool);
     if(!tool){
-      history.push({error:"Такой операции нет в каталоге этой сессии. Выбери точное имя из catalog. Для создания страницы ориентируйся на инструменты оформления сайта.",
+      history.push({error:"Такой операции нет в каталоге этой сессии. Выбери точное имя из catalog.",catalog:directory,
         siteTools:[templatesTool,previewTool,styleTool].filter(t=>names.has(t.name)).map(t=>t.name),
         treeTools:[...names.keys()].filter(name=>name.startsWith("cms_tree_"))});
       continue;
@@ -225,7 +303,11 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       history.push({schema});continue;
     }
     if(step.action!=="execute")throw new Error("Неизвестный тип шага.");
-    if(!schemas.has(tool.name)){history.push({tool:tool.name,error:"Запроси schema в текущем запуске перед execute."});continue;}
+    // Execute may come without a separate schema step: the service loads the schema itself;
+    // a rejected call returns the schema with the error so the next step can fix the arguments.
+    if(!schemas.has(tool.name)){
+      schemas.set(tool.name,[previewTool,styleTool,templatesTool].includes(tool)?tool:(await api(s,"/tools/"+tool.name)).tool);
+    }
     const args=JSON.parse(step.arguments_json);
     if(!args||Array.isArray(args)||typeof args!=="object")throw new Error("Некорректные параметры.");
     if(tool===templatesTool){
@@ -276,8 +358,8 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
     try{
       result=(await api(s,"/tools/"+tool.name,args)).data;
     }catch(error){
-      if(![404,422].includes(error.status))throw error;
-      history.push({tool:tool.name,args,error:error.treeMissing?"Раздел не найден.":error.message});
+      if(![400,404,422].includes(error.status))throw error;
+      history.push({tool:tool.name,args,error:error.treeMissing?"Раздел не найден.":error.message,schema:schemas.get(tool.name)});
       continue;
     }
     if(localRead){
@@ -351,6 +433,10 @@ async function agentWork(req){
     text="Поручение остановлено. Выполненные шаги сохранены в ходе работы.";state={canceled:true};
   }
   await s.progress.flush();
+  if(s.usage && s.lastCall){
+    if(s.contextParts && s.contextHistory)s.contextParts.tools=JSON.stringify(s.contextHistory).length;
+    s.usage.context={lastInput:s.lastCall.input,lastCached:s.lastCall.cached,parts:s.contextParts??{}};
+  }
   return store(s,"agentFinish",{...ref,...state,text,pending:state.canceled?null:s.pending,record:s.record,usage:s.usage??null,screenshots:[...s.screenshots.values()]});
 }
 async function body(req){

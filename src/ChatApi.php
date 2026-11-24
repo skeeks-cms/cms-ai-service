@@ -71,9 +71,10 @@ final class ChatApi
         $events = $run && in_array($run['status'], self::ACTIVE, true) ? self::runEvents((int)$run['id']) : [];
         $runStats = [];
         foreach ((new Query())->from(self::RUN)->where(['chat_id' => $chat['id']])->andWhere(['not in', 'status', self::ACTIVE])
-            ->select(['message_id', 'tokens_input', 'tokens_output', 'cost_usd', 'model', 'created_at', 'finished_at'])->all() as $row) {
+            ->select(['message_id', 'tokens_input', 'tokens_cached', 'tokens_output', 'cost_usd', 'model', 'created_at', 'finished_at'])->all() as $row) {
             $stat = &$runStats[$row['message_id']];
             $stat['tokens'] = ($stat['tokens'] ?? 0) + (int)$row['tokens_input'] + (int)$row['tokens_output'];
+            $stat['cached'] = ($stat['cached'] ?? 0) + (int)$row['tokens_cached'];
             $stat['seconds'] = ($stat['seconds'] ?? 0) + max(0, (int)$row['finished_at'] - (int)$row['created_at']);
             $stat['cost'] = $row['cost_usd'] === null ? ($stat['cost'] ?? null) : (($stat['cost'] ?? 0) + (float)$row['cost_usd']);
             $stat['model'] = $row['model'] ? ModelCatalog::title((string)$row['model']) : ($stat['model'] ?? null);
@@ -105,6 +106,7 @@ final class ChatApi
             'events' => $events,
             'steps' => (object)$steps,
             'runStats' => (object)$runStats,
+            'context' => self::contextOf((int)$chat['id'], (string)$chat['engine']),
             'lastEventId' => (int)((new Query())->from(self::EVENT)->where(['chat_id' => $chat['id']])->max('id') ?: 0),
         ];
     }
@@ -420,6 +422,39 @@ final class ChatApi
             throw new NotFoundHttpException();
         }
         return $file;
+    }
+
+    /**
+     * Fill of the chat's engine context after its last run, like the context panel of a desktop agent:
+     * size of the last model call against the model window; the service's own parts estimated from
+     * characters (~3 per token), the rest is the engine's own prompt and the session history.
+     */
+    private static function contextOf(int $chatId, string $engine): ?array
+    {
+        $run = (new Query())->from(self::RUN)->where(['chat_id' => $chatId])->andWhere(['not', ['context' => null]])
+            ->orderBy(['id' => SORT_DESC])->select(['context', 'model'])->one();
+        if (!$run) {
+            return null;
+        }
+        $context = json_decode($run['context'], true) ?: [];
+        $used = (int)($context['lastInput'] ?? 0);
+        $parts = [];
+        $known = 0;
+        $titles = ['rules' => 'Правила SkeekS и сайта', 'catalog' => 'Каталог операций', 'skills' => 'Навыки',
+            'attachments' => 'Вложения', 'conversation' => 'Сообщения чата', 'tools' => 'Результаты операций'];
+        foreach ($titles as $key => $title) {
+            $tokens = (int)round(($context['parts'][$key] ?? 0) / 3);
+            if ($tokens > 0) {
+                $parts[] = ['key' => $key, 'title' => $title, 'tokens' => $tokens, 'estimate' => true];
+                $known += $tokens;
+            }
+        }
+        $parts[] = ['key' => 'engine', 'title' => 'Служебная часть движка и история сессии', 'tokens' => max(0, $used - $known), 'estimate' => true];
+        $model = (string)($run['model'] ?? '');
+        $window = ModelCatalog::contextWindow($engine, $model);
+        return ['used' => $used, 'cached' => (int)($context['lastCached'] ?? 0), 'window' => $window,
+            'compactAt' => $window ? (int)floor($window * 0.95) : 0, 'model' => $model !== '' ? ModelCatalog::title($model) : null,
+            'parts' => $parts];
     }
 
     /** Reasoning levels of each engine's default model, for the composer. */

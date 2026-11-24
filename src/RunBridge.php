@@ -48,7 +48,22 @@ final class RunBridge
             'tokens_input' => $input, 'tokens_cached' => $cached, 'tokens_output' => $output,
             'model_calls' => $int($usage['calls'] ?? 0), 'tool_calls' => $int($usage['tools'] ?? 0),
             'cost_usd' => $usd, 'cost_source' => $source,
+            'context' => self::context($usage['context'] ?? null),
         ], ['id' => $run['id']])->execute();
+    }
+
+    /** Context of the last model call, kept as JSON with integer fields only. */
+    private static function context($context): ?string
+    {
+        if (!is_array($context)) {
+            return null;
+        }
+        $parts = [];
+        foreach (['rules', 'catalog', 'skills', 'attachments', 'conversation', 'tools'] as $key) {
+            $parts[$key] = max(0, (int)($context['parts'][$key] ?? 0));
+        }
+        return json_encode(['lastInput' => max(0, (int)($context['lastInput'] ?? 0)),
+            'lastCached' => max(0, (int)($context['lastCached'] ?? 0)), 'parts' => $parts], JSON_THROW_ON_ERROR);
     }
 
     public static function handle(string $op, array $chat, array $data): array
