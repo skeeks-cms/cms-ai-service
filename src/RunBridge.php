@@ -77,7 +77,7 @@ final class RunBridge
                 return [
                     'message' => $message, 'messageId' => (int)$run['message_id'],
                     'confirmed' => json_decode($run['confirmation'] ?? 'null', true), 'state' => (object)$state, 'cancel' => $cancel,
-                    'model' => $run['model'] ?? null,
+                    'model' => $run['model'] ?? null, 'effort' => $run['effort'] ?? null,
                 ];
             case 'agentEvent':
                 $text = (string)($data['text'] ?? '');

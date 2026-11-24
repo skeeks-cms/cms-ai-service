@@ -61,7 +61,7 @@ final class ChatApi
         }
         if ($id === null) {
             return ['chatId' => null, 'title' => self::DEFAULT_TITLE, 'engine' => $engines[0] ?? null, 'engines' => $engines,
-                'models' => $models, 'model' => null,
+                'models' => $models, 'model' => null, 'effort' => null, 'engineEfforts' => self::engineEfforts($engines),
                 'company' => $company ?: null, 'history' => [], 'files' => [], 'pending' => null, 'run' => null, 'events' => [], 'lastEventId' => 0];
         }
         $chat = self::find((int)$id);
@@ -93,6 +93,8 @@ final class ChatApi
             'engines' => $engines,
             'models' => $models,
             'model' => $chat['model'] ?? null,
+            'effort' => $chat['effort'] ?? null,
+            'engineEfforts' => self::engineEfforts($engines),
             'company' => $chat['company_id'] ? (int)$chat['company_id'] : null,
             'history' => (new Query())->from(self::MESSAGE)->where(['chat_id' => $chat['id']])
                 ->select(['id', 'role', 'text'])->orderBy('id')->all(),
@@ -132,8 +134,9 @@ final class ChatApi
         }
         $requestKey = hash('sha256', 'message|' . $clientKey);
         $model = trim((string)($data['model'] ?? ''));
+        $effort = trim((string)($data['effort'] ?? ''));
         $db = Yii::$app->db;
-        [$runId, $created] = $db->transaction(function () use ($db, $data, $scope, $text, $files, $requestKey, $model) {
+        [$runId, $created] = $db->transaction(function () use ($db, $data, $scope, $text, $files, $requestKey, $model, $effort) {
             $chatId = isset($data['chatId']) ? (int)$data['chatId'] : 0;
             if ($chatId) {
                 self::lock($chatId);
@@ -162,8 +165,12 @@ final class ChatApi
             if ($model !== '' && !ModelCatalog::allowed((string)$chat['engine'], $model)) {
                 throw new ForbiddenHttpException('Эта модель недоступна для аккаунта.');
             }
-            $db->createCommand()->update(self::CHAT, ['model' => $model !== '' ? $model : null], ['id' => $chatId])->execute();
+            if ($effort !== '' && !in_array($effort, ModelCatalog::efforts((string)$chat['engine'], $model), true)) {
+                throw new BadRequestHttpException('Эта глубина рассуждений недоступна для выбранной модели.');
+            }
+            $db->createCommand()->update(self::CHAT, ['model' => $model !== '' ? $model : null, 'effort' => $effort !== '' ? $effort : null], ['id' => $chatId])->execute();
             $chat['model'] = $model !== '' ? $model : null;
+            $chat['effort'] = $effort !== '' ? $effort : null;
             $db->createCommand()->insert(self::MESSAGE, [
                 'chat_id' => $chatId, 'role' => 'user', 'text' => $text, 'created_at' => time(),
             ])->execute();
@@ -415,6 +422,16 @@ final class ChatApi
         return $file;
     }
 
+    /** Reasoning levels of each engine's default model, for the composer. */
+    private static function engineEfforts(array $engines): array
+    {
+        $result = [];
+        foreach ($engines as $engine) {
+            $result[$engine] = ModelCatalog::efforts($engine, '');
+        }
+        return $result;
+    }
+
     /** Link to the record an action created or changed, in this installation's administration. */
     public static function recordLink(string $tool, int $id): ?array
     {
@@ -530,7 +547,7 @@ final class ChatApi
         $db->createCommand()->insert(self::RUN, [
             'chat_id' => $chat['id'], 'message_id' => $messageId, 'request_key' => $requestKey,
             'confirmation' => $confirmation === null ? null : json_encode($confirmation, JSON_THROW_ON_ERROR),
-            'engine' => $chat['engine'], 'model' => $chat['model'] ?? null, 'status' => 'queued', 'state' => '{}',
+            'engine' => $chat['engine'], 'model' => $chat['model'] ?? null, 'effort' => $chat['effort'] ?? null, 'status' => 'queued', 'state' => '{}',
             'credential' => RunCredentials::encrypt(RunCredentials::issue($userId)),
             'created_by' => $userId, 'created_at' => time(), 'updated_at' => time(),
         ])->execute();

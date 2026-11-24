@@ -38,10 +38,29 @@ final class ModelCatalog
         $result = [];
         foreach (self::models() as $id => $model) {
             if (($model['engine'] ?? '') === $engineKey && empty($model['hidden'])) {
-                $result[] = ['id' => (string)$id, 'title' => (string)($model['title'] ?? $id)];
+                $result[] = ['id' => (string)$id, 'title' => (string)($model['title'] ?? $id),
+                    'efforts' => array_values(array_intersect(self::EFFORTS, (array)($model['efforts'] ?? [])))];
             }
         }
         return $result;
+    }
+
+    /** Reasoning levels the executor may pass; the model list narrows them. */
+    public const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+    /** Efforts of a model of the engine, or of the engine default (params cmsAi.engineEfforts). */
+    public static function efforts(string $engine, string $model): array
+    {
+        if ($model !== '') {
+            foreach (self::forEngine($engine) as $item) {
+                if ($item['id'] === $model) {
+                    return $item['efforts'];
+                }
+            }
+            return [];
+        }
+        $engineKey = preg_replace('/-.*$/', '', $engine);
+        return array_values(array_intersect(self::EFFORTS, (array)(Yii::$app->params['cmsAi']['engineEfforts'][$engineKey] ?? [])));
     }
 
     public static function allowed(string $engine, string $model): bool
