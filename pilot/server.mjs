@@ -83,6 +83,14 @@ async function chatTurn(s, turn, image, request = turn, steps = []) {
     await store(s, "bindEngine", {engine: s.engine.id, session: result.sessionId});
     s.engineSession = result.sessionId;
   }
+  // Token usage of the run: summed over model calls; cost only when the engine reports it for every call.
+  const u = result.usage, total = s.usage ??= {input:0,cached:0,output:0,calls:0,tools:0,model:"",costUsd:0,costKnown:true};
+  total.calls++;
+  if (u && typeof u === "object") {
+    for (const k of ["input","cached","output"]) total[k] += Math.max(0, Number(u[k]) || 0);
+    if (typeof u.model === "string" && u.model) total.model = u.model.slice(0,100);
+    if (typeof u.costUsd === "number") total.costUsd += u.costUsd; else total.costKnown = false;
+  } else total.costKnown = false;
   return result.step;
 }
 async function loadChat(s,id){
@@ -263,6 +271,7 @@ async function run(s,message,{messageId,worker=false,outcome=null}) {
       return "Подтвердите действие в CRM.";
     }
     s.progress.push(stepLabel(tool.name),"tool");
+    if(s.usage)s.usage.tools++;
     let result;
     try{
       result=(await api(s,"/tools/"+tool.name,args)).data;
@@ -340,7 +349,7 @@ async function agentWork(req){
     text="Поручение остановлено. Выполненные шаги сохранены в ходе работы.";state={canceled:true};
   }
   await s.progress.flush();
-  return store(s,"agentFinish",{...ref,...state,text,pending:state.canceled?null:s.pending,record:s.record,screenshots:[...s.screenshots.values()]});
+  return store(s,"agentFinish",{...ref,...state,text,pending:state.canceled?null:s.pending,record:s.record,usage:s.usage??null,screenshots:[...s.screenshots.values()]});
 }
 async function body(req){
   req.setEncoding("utf8");

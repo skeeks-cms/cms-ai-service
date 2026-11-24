@@ -29,6 +29,27 @@ final class RunBridge
         return array_column($notes, 'text');
     }
 
+    /** Token usage reported by the executor for the whole run, with a reference cost. */
+    private static function saveUsage(array $run, $usage): void
+    {
+        if (!is_array($usage)) {
+            return;
+        }
+        $int = static fn($v) => max(0, min(PHP_INT_MAX, (int)$v));
+        $input = $int($usage['input'] ?? 0);
+        $cached = min($input, $int($usage['cached'] ?? 0));
+        $output = $int($usage['output'] ?? 0);
+        $model = ModelCatalog::resolve((string)$run['engine'], is_string($usage['model'] ?? null) ? trim($usage['model']) : '');
+        $engineCost = !empty($usage['costKnown']) && is_numeric($usage['costUsd'] ?? null) ? (float)$usage['costUsd'] : null;
+        [$usd, $source] = ModelCatalog::estimate($model, $input, $cached, $output, $engineCost);
+        Yii::$app->db->createCommand()->update(ChatApi::RUN, [
+            'model' => $model !== '' ? $model : null,
+            'tokens_input' => $input, 'tokens_cached' => $cached, 'tokens_output' => $output,
+            'model_calls' => $int($usage['calls'] ?? 0), 'tool_calls' => $int($usage['tools'] ?? 0),
+            'cost_usd' => $usd, 'cost_source' => $source,
+        ], ['id' => $run['id']])->execute();
+    }
+
     public static function handle(string $op, array $chat, array $data): array
     {
         $run = (new Query())->from(ChatApi::RUN)->where(['id' => (int)($data['run'] ?? 0), 'chat_id' => $chat['id']])->one();
@@ -99,6 +120,7 @@ final class RunBridge
                     && !str_contains($text, $link['url'])) {
                     $text .= "\n\n[" . $link['label'] . '](' . $link['url'] . ')';
                 }
+                self::saveUsage($run, $data['usage'] ?? null);
                 ChatApi::finish($run, $status, $text, $pending, $screenshots);
                 // A message sent during the run that the executor never read starts the next run.
                 if ($status === 'succeeded' && !$pending) {

@@ -64,6 +64,16 @@ final class ChatApi
         $chat = self::find((int)$id);
         $run = self::latestRun((int)$chat['id']);
         $events = $run && in_array($run['status'], self::ACTIVE, true) ? self::runEvents((int)$run['id']) : [];
+        $runStats = [];
+        foreach ((new Query())->from(self::RUN)->where(['chat_id' => $chat['id']])->andWhere(['not in', 'status', self::ACTIVE])
+            ->select(['message_id', 'tokens_input', 'tokens_output', 'cost_usd', 'model', 'created_at', 'finished_at'])->all() as $row) {
+            $stat = &$runStats[$row['message_id']];
+            $stat['tokens'] = ($stat['tokens'] ?? 0) + (int)$row['tokens_input'] + (int)$row['tokens_output'];
+            $stat['seconds'] = ($stat['seconds'] ?? 0) + max(0, (int)$row['finished_at'] - (int)$row['created_at']);
+            $stat['cost'] = $row['cost_usd'] === null ? ($stat['cost'] ?? null) : (($stat['cost'] ?? 0) + (float)$row['cost_usd']);
+            $stat['model'] = $row['model'] ? ModelCatalog::title((string)$row['model']) : ($stat['model'] ?? null);
+            unset($stat);
+        }
         $steps = [];
         foreach ((new Query())->from(['e' => self::EVENT])->innerJoin(['r' => self::RUN], 'r.id = e.run_id')
             ->where(['e.chat_id' => $chat['id'], 'e.type' => ['tool', 'step']])
@@ -85,6 +95,7 @@ final class ChatApi
             'run' => $run ? self::runSummary($run) : null,
             'events' => $events,
             'steps' => (object)$steps,
+            'runStats' => (object)$runStats,
             'lastEventId' => (int)((new Query())->from(self::EVENT)->where(['chat_id' => $chat['id']])->max('id') ?: 0),
         ];
     }
@@ -296,6 +307,53 @@ final class ChatApi
         $chat = (new Query())->from(self::CHAT)->where(['id' => $run['chat_id']])->one();
         $runId = self::createRun($chat, (int)$last['id'], hash('sha256', 'followup|' . $last['id']), null);
         self::queue($runId);
+    }
+
+    /**
+     * Token usage of the employee and, for administrators, of the whole installation (the SkeekS AI
+     * account of this site) for the current month; the open chat over all time.
+     */
+    public static function usage(?int $chatId): array
+    {
+        $scope = self::scope();
+        $since = (int)strtotime(date('Y-m-01 00:00:00'));
+        $sum = ['runs' => 'COUNT(*)', 'input' => 'SUM(r.tokens_input)', 'cached' => 'SUM(r.tokens_cached)',
+            'output' => 'SUM(r.tokens_output)', 'cost' => 'SUM(r.cost_usd)', 'unpriced' => 'SUM(r.cost_usd IS NULL)',
+            'seconds' => 'SUM(GREATEST(0, COALESCE(r.finished_at, r.updated_at) - r.created_at))'];
+        $base = static fn() => (new Query())->from(['r' => self::RUN])->innerJoin(['c' => self::CHAT], 'c.id = r.chat_id')
+            ->where(['c.site_id' => $scope['site_id']]);
+        $cast = static function (array $rows): array {
+            foreach ($rows as &$row) {
+                foreach (['runs', 'input', 'cached', 'output', 'unpriced', 'seconds'] as $k) {
+                    $row[$k] = (int)($row[$k] ?? 0);
+                }
+                $row['cost'] = $row['cost'] === null ? null : round((float)$row['cost'], 4);
+            }
+            return $rows;
+        };
+        $result = ['month' => date('m.Y'), 'chat' => null];
+        if ($chatId) {
+            self::find($chatId);
+            $result['chat'] = $cast([$base()->andWhere(['r.chat_id' => $chatId])->select($sum)->one()])[0];
+        }
+        $mine = $base()->andWhere(['r.created_by' => $scope['owner_id']])->andWhere(['>=', 'r.created_at', $since]);
+        $result['mine'] = $cast([(clone $mine)->select($sum)->one()])[0];
+        $result['mineByModel'] = $cast((clone $mine)->select(['model' => "COALESCE(r.model, '')"] + $sum)->groupBy('r.model')->orderBy(['output' => SORT_DESC])->all());
+        $result['mineByChat'] = $cast((clone $mine)->select(['chat' => 'c.id', 'title' => 'c.title'] + $sum)->groupBy('c.id')->orderBy(['input' => SORT_DESC])->limit(10)->all());
+        $result['mineByProject'] = $cast((clone $mine)->leftJoin(['p' => '{{%cms_project}}'], 'p.id = c.project_id')
+            ->select(['project' => "COALESCE(p.name, '')"] + $sum)->groupBy('c.project_id')->orderBy(['input' => SORT_DESC])->all());
+        foreach ($result['mineByModel'] as &$row) {
+            $row['title'] = $row['model'] !== '' ? ModelCatalog::title($row['model']) : 'Модель не указана';
+        }
+        unset($row);
+        if (Yii::$app->user->can(\skeeks\cms\rbac\CmsManager::PERMISSION_ROLE_ADMIN_ACCESS)) {
+            $all = $base()->andWhere(['>=', 'r.created_at', $since]);
+            $result['account'] = $cast([(clone $all)->select($sum)->one()])[0];
+            $result['accountByUser'] = $cast((clone $all)->leftJoin(['u' => '{{%cms_user}}'], 'u.id = r.created_by')
+                ->select(['user' => "COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.last_name, u.first_name)), ''), u.username, r.created_by)"] + $sum)
+                ->groupBy('r.created_by')->orderBy(['input' => SORT_DESC])->all());
+        }
+        return $result;
     }
 
     public static function rename(int $chatId, string $title): void
