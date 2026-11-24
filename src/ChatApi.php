@@ -249,6 +249,40 @@ final class ChatApi
         return self::runSummary(self::findRun($runId));
     }
 
+    public static function rename(int $chatId, string $title): void
+    {
+        $title = trim(preg_replace('/\s+/u', ' ', $title));
+        if ($title === '' || mb_strlen($title) > 120) {
+            throw new BadRequestHttpException('Название — от 1 до 120 символов.');
+        }
+        self::find($chatId);
+        Yii::$app->db->createCommand()->update(self::CHAT, ['title' => $title], ['id' => $chatId])->execute();
+    }
+
+    /**
+     * Permanent removal (owner decision 24.11.2026): messages, attachments, runs, events
+     * and engine bindings go with the chat through foreign keys. A working run is stopped first.
+     */
+    public static function delete(int $chatId): void
+    {
+        Yii::$app->db->transaction(function () use ($chatId) {
+            self::lock($chatId);
+            self::find($chatId);
+            self::reconcile($chatId);
+            if ((new Query())->from(self::RUN)->where(['chat_id' => $chatId, 'status' => self::ACTIVE])->exists()) {
+                throw new ConflictHttpException('В чате выполняется поручение. Остановите его и удалите чат.');
+            }
+            foreach ((new Query())->from(self::RUN)->where(['chat_id' => $chatId])->andWhere(['not', ['credential' => null]])
+                ->select('credential')->column() as $cipher) {
+                $token = RunCredentials::decrypt($cipher);
+                if ($token !== null) {
+                    RunCredentials::revoke($token);
+                }
+            }
+            Yii::$app->db->createCommand()->delete(self::CHAT, ['id' => $chatId])->execute();
+        });
+    }
+
     public static function file(int $chatId, int $fileId): array
     {
         self::find($chatId);
